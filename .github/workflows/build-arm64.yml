@@ -1,0 +1,74 @@
+name: Build ARM64 Binary
+
+on:
+  schedule:
+    # Building every 6 hours at 00:00, 06:00, 12:00, 18:00 UTC
+    - cron: '0 0,6,12,18 * * *'
+  workflow_dispatch: # manual trigger
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check for new gallery-dl release
+        id: check
+        run: |
+          LATEST=$(curl -s https://api.github.com/repos/mikf/gallery-dl/releases/latest | jq -r .tag_name)
+          CURRENT=$(curl -s https://api.github.com/repos/gdluxx/gdl-arm/releases/latest | jq -r .tag_name 2>/dev/null || echo "none")
+          echo "latest=$LATEST" >> $GITHUB_OUTPUT
+          echo "current=$CURRENT" >> $GITHUB_OUTPUT
+          if [ "$LATEST" != "$CURRENT" ]; then
+            echo "needs_build=true" >> $GITHUB_OUTPUT
+          else
+            echo "needs_build=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set up QEMU
+        if: steps.check.outputs.needs_build == 'true'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        if: steps.check.outputs.needs_build == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build ARM64 binary
+        if: steps.check.outputs.needs_build == 'true'
+        run: |
+          VERSION="${{ steps.check.outputs.latest }}"
+
+          docker buildx build \
+            --platform linux/arm64 \
+            --build-arg VERSION=$VERSION \
+            --load \
+            -t gdl-arm64-builder \
+            -f - . <<'EOF'
+          FROM --platform=linux/arm64 python:3.11-slim-bullseye
+          ARG VERSION
+          WORKDIR /build
+          RUN apt-get update && apt-get install -y --no-install-recommends \
+              gcc libffi-dev libsecret-1-dev pkg-config git \
+              && rm -rf /var/lib/apt/lists/* \
+              && git clone --depth 1 --branch ${VERSION} https://github.com/mikf/gallery-dl.git /build
+          RUN python -m venv /build/venv && \
+              /build/venv/bin/pip install --upgrade pip && \
+              /build/venv/bin/pip install requests yt-dlp PyYAML secretstorage truststore Jinja2 pyinstaller
+          RUN /build/venv/bin/python scripts/pyinstaller.py -o linux -a arm64 -e bin
+          EOF
+
+          CONTAINER_ID=$(docker create gdl-arm64-builder)
+          docker cp "${CONTAINER_ID}:/build/dist/gallery-dl_linux.bin" ./gallery-dl.bin
+          docker rm "$CONTAINER_ID"
+
+      - name: Create Release
+        if: steps.check.outputs.needs_build == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.check.outputs.latest }}
+          name: gallery-dl ${{ steps.check.outputs.latest }} (ARM64)
+          body: |
+            ARM64 build of gallery-dl ${{ steps.check.outputs.latest }}
+
+            Built automatically from [mikf/gallery-dl](https://github.com/mikf/gallery-dl/releases/tag/${{ steps.check.outputs.latest }})
+
+            Builds run at 00:00, 06:00, 12:00, 18:00 UTC daily.
+          files: gallery-dl.bin
